@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: © 2015 LabStack LLC and Echo contributors
+
 package echo
 
 import (
@@ -6,9 +9,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
-	"runtime"
 	"strings"
+
+	"github.com/labstack/echo/v4/internal/pathutil"
 )
 
 type filesystem struct {
@@ -56,6 +61,14 @@ func StaticDirectoryHandler(fileSystem fs.FS, disablePathUnescaping bool) Handle
 	return func(c Context) error {
 		p := c.Param("*")
 		if !disablePathUnescaping { // when router is already unescaping we do not want to do is twice
+			// The router matches routes against the raw, still-encoded request path, so an
+			// encoded path separator (%2F or %5C) is not treated as a segment boundary during
+			// routing. Unescaping it here would let it act as a separator and resolve a file
+			// outside the path the router authorized, bypassing route-level middleware (e.g. auth
+			// on a sibling route). No real filename contains a separator, so reject it as not found.
+			if pathutil.HasEncodedPathSeparator(p) {
+				return ErrNotFound
+			}
 			tmpPath, err := url.PathUnescape(p)
 			if err != nil {
 				return fmt.Errorf("failed to unescape path variable: %w", err)
@@ -63,8 +76,11 @@ func StaticDirectoryHandler(fileSystem fs.FS, disablePathUnescaping bool) Handle
 			p = tmpPath
 		}
 
-		// fs.FS.Open() already assumes that file names are relative to FS root path and considers name with prefix `/` as invalid
-		name := filepath.ToSlash(filepath.Clean(strings.TrimPrefix(p, "/")))
+		// fs.FS.Open() already assumes that file names are relative to FS root path and considers name with prefix `/` as invalid.
+		// Use path.Clean (not filepath.Clean): fs.FS paths are always forward-slash, so a backslash must stay a literal
+		// character rather than being interpreted as a separator on Windows (which would resolve a file across a boundary
+		// the router never matched on).
+		name := path.Clean(strings.TrimPrefix(p, "/"))
 		fi, err := fs.Stat(fileSystem, name)
 		if err != nil {
 			return ErrNotFound
@@ -100,8 +116,8 @@ func StaticFileHandler(file string, filesystem fs.FS) HandlerFunc {
 // traverse up from current executable run path.
 // NB: private because you really should use fs.FS implementation instances
 type defaultFS struct {
-	prefix string
 	fs     fs.FS
+	prefix string
 }
 
 func newDefaultFS() *defaultFS {
@@ -125,7 +141,7 @@ func subFS(currentFs fs.FS, root string) (fs.FS, error) {
 		// we need to make exception for `defaultFS` instances as it interprets root prefix differently from fs.FS.
 		// fs.Fs.Open does not like relative paths ("./", "../") and absolute paths at all but prior echo.Filesystem we
 		// were able to use paths like `./myfile.log`, `/etc/hosts` and these would work fine with `os.Open` but not with fs.Fs
-		if isRelativePath(root) {
+		if !filepath.IsAbs(root) {
 			root = filepath.Join(dFS.prefix, root)
 		}
 		return &defaultFS{
@@ -134,21 +150,6 @@ func subFS(currentFs fs.FS, root string) (fs.FS, error) {
 		}, nil
 	}
 	return fs.Sub(currentFs, root)
-}
-
-func isRelativePath(path string) bool {
-	if path == "" {
-		return true
-	}
-	if path[0] == '/' {
-		return false
-	}
-	if runtime.GOOS == "windows" && strings.IndexByte(path, ':') != -1 {
-		// https://docs.microsoft.com/en-us/windows/win32/fileio/naming-a-file?redirectedfrom=MSDN#file_and_directory_names
-		// https://docs.microsoft.com/en-us/dotnet/standard/io/file-path-formats
-		return false
-	}
-	return true
 }
 
 // MustSubFS creates sub FS from current filesystem or panic on failure.
