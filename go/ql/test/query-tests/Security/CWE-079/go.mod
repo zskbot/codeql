@@ -10,5 +10,5 @@ require (
 
 require (
 	github.com/gobwas/ws v1.0.3 // indirect
-	github.com/klauspost/compress v1.10.3 // indirect
+	github.com/klauspost/compress v1.18.7 // indirect
 )
