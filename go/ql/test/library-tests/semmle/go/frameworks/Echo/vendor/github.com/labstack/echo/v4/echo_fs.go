@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: © 2015 LabStack LLC and Echo contributors
+
 package echo
 
 import (
@@ -6,8 +9,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
-	"runtime"
 	"strings"
 )
 
@@ -33,7 +36,7 @@ func (e *Echo) Static(pathPrefix, fsRoot string) *Route {
 	return e.Add(
 		http.MethodGet,
 		pathPrefix+"*",
-		StaticDirectoryHandler(subFs, false),
+		StaticDirectoryHandler(subFs, !e.EnablePathUnescapingStaticFiles),
 	)
 }
 
@@ -46,25 +49,44 @@ func (e *Echo) StaticFS(pathPrefix string, filesystem fs.FS) *Route {
 	return e.Add(
 		http.MethodGet,
 		pathPrefix+"*",
-		StaticDirectoryHandler(filesystem, false),
+		StaticDirectoryHandler(filesystem, !e.EnablePathUnescapingStaticFiles),
 	)
 }
 
-// StaticDirectoryHandler creates handler function to serve files from provided file system
+// StaticDirectoryHandler creates handler function to serve files from provided file system.
 // When disablePathUnescaping is set then file name from path is not unescaped and is served as is.
+//
+// Note: when disablePathUnescaping=false, the handler decodes the wildcard param before serving.
+// If route guards (e.g. e.GET("/admin/*", forbidden)) are used to restrict parts of the
+// filesystem, an encoded separator (%2F) or encoded dot-dot (%2E%2E) in the URL can resolve to
+// a path that the router never matched against the guard route. Do not rely on route guards
+// alone to restrict a filesystem served by this handler.
+// See https://github.com/labstack/echo/security/advisories/GHSA-vfp3-v2gw-7wfq
 func StaticDirectoryHandler(fileSystem fs.FS, disablePathUnescaping bool) HandlerFunc {
 	return func(c Context) error {
 		p := c.Param("*")
+		// The router matches the path as it was sent, but the file name is resolved with path.Clean(). A path with a
+		// ".", ".." or empty segment could therefore reach a file under a route that the router never matched, for
+		// example `/assets/../admin/private.txt` bypassing a guarded `/admin/*` route (GHSA-3pmx-cf9f-34xr).
+		if hasUncleanPath(c.Request()) || hasDotOrEmptySegment(p) {
+			return ErrNotFound
+		}
 		if !disablePathUnescaping { // when router is already unescaping we do not want to do is twice
 			tmpPath, err := url.PathUnescape(p)
 			if err != nil {
 				return fmt.Errorf("failed to unescape path variable: %w", err)
 			}
 			p = tmpPath
+			if hasDotOrEmptySegment(p) { // unescaping can create new dot segments, e.g. `%2e%2e`
+				return ErrNotFound
+			}
 		}
 
-		// fs.FS.Open() already assumes that file names are relative to FS root path and considers name with prefix `/` as invalid
-		name := filepath.ToSlash(filepath.Clean(strings.TrimPrefix(p, "/")))
+		// fs.FS.Open() already assumes that file names are relative to FS root path and considers name with prefix `/` as invalid.
+		// Use path.Clean (not filepath.Clean): fs.FS paths are always forward-slash, so a backslash must stay a literal
+		// character rather than being interpreted as a separator on Windows (which would resolve a file across a boundary
+		// the router never matched on).
+		name := path.Clean(strings.TrimPrefix(p, "/"))
 		fi, err := fs.Stat(fileSystem, name)
 		if err != nil {
 			return ErrNotFound
@@ -100,8 +122,8 @@ func StaticFileHandler(file string, filesystem fs.FS) HandlerFunc {
 // traverse up from current executable run path.
 // NB: private because you really should use fs.FS implementation instances
 type defaultFS struct {
-	prefix string
 	fs     fs.FS
+	prefix string
 }
 
 func newDefaultFS() *defaultFS {
@@ -125,7 +147,7 @@ func subFS(currentFs fs.FS, root string) (fs.FS, error) {
 		// we need to make exception for `defaultFS` instances as it interprets root prefix differently from fs.FS.
 		// fs.Fs.Open does not like relative paths ("./", "../") and absolute paths at all but prior echo.Filesystem we
 		// were able to use paths like `./myfile.log`, `/etc/hosts` and these would work fine with `os.Open` but not with fs.Fs
-		if isRelativePath(root) {
+		if !filepath.IsAbs(root) {
 			root = filepath.Join(dFS.prefix, root)
 		}
 		return &defaultFS{
@@ -134,21 +156,6 @@ func subFS(currentFs fs.FS, root string) (fs.FS, error) {
 		}, nil
 	}
 	return fs.Sub(currentFs, root)
-}
-
-func isRelativePath(path string) bool {
-	if path == "" {
-		return true
-	}
-	if path[0] == '/' {
-		return false
-	}
-	if runtime.GOOS == "windows" && strings.IndexByte(path, ':') != -1 {
-		// https://docs.microsoft.com/en-us/windows/win32/fileio/naming-a-file?redirectedfrom=MSDN#file_and_directory_names
-		// https://docs.microsoft.com/en-us/dotnet/standard/io/file-path-formats
-		return false
-	}
-	return true
 }
 
 // MustSubFS creates sub FS from current filesystem or panic on failure.
@@ -166,10 +173,76 @@ func MustSubFS(currentFs fs.FS, fsRoot string) fs.FS {
 }
 
 func sanitizeURI(uri string) string {
+	// Browsers remove tab and newline characters from URLs, so `/\t/example.com` is `//example.com` to them and a
+	// control character could hide the double slash from the check below. Percent-encode C0 control characters and
+	// DEL first; the browser then requests the same path.
+	uri = escapeControlChars(uri)
 	// double slash `\\`, `//` or even `\/` is absolute uri for browsers and by redirecting request to that uri
 	// we are vulnerable to open redirect attack. so replace all slashes from the beginning with single slash
 	if len(uri) > 1 && (uri[0] == '\\' || uri[0] == '/') && (uri[1] == '\\' || uri[1] == '/') {
 		uri = "/" + strings.TrimLeft(uri, `/\`)
 	}
 	return uri
+}
+
+// escapeControlChars percent-encodes C0 control characters and DEL in s.
+// Keep in sync with the copy in middleware/slash.go.
+func escapeControlChars(s string) string {
+	i := 0
+	for i < len(s) && s[i] >= 0x20 && s[i] != 0x7f {
+		i++
+	}
+	if i == len(s) {
+		return s
+	}
+	const hexDigits = "0123456789ABCDEF"
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+	b.WriteString(s[:i])
+	for ; i < len(s); i++ {
+		if ch := s[i]; ch < 0x20 || ch == 0x7f {
+			b.WriteByte('%')
+			b.WriteByte(hexDigits[ch>>4])
+			b.WriteByte(hexDigits[ch&0x0f])
+		} else {
+			b.WriteByte(ch)
+		}
+	}
+	return b.String()
+}
+
+// hasDotOrEmptySegment reports whether URL path p has a ".", ".." or empty segment, or a segment with a "." or ".."
+// part between backslashes (e.g. `..\x`). A single leading and a single trailing slash are allowed.
+// Keep in sync with the copy in middleware/static.go.
+func hasDotOrEmptySegment(p string) bool {
+	p = strings.TrimPrefix(p, "/")
+	p = strings.TrimSuffix(p, "/")
+	if p == "" {
+		return false
+	}
+	for segment := range strings.SplitSeq(p, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return true
+		}
+		// A backslash is a literal character in fs.FS names, but a filesystem that wrongly treats it as a separator
+		// (for example one built on filepath.Join on Windows) would resolve `..\` outside its root.
+		if strings.Contains(segment, `\`) {
+			for part := range strings.SplitSeq(segment, `\`) {
+				if part == "." || part == ".." {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// hasUncleanPath reports whether the request path, in the form the router matches by default (the escaped path when it
+// differs from the default encoding), has a ".", ".." or empty segment. Encoded dots such as `%2E%2E` are not
+// segments here; they only act as `..` when path unescaping for static files is enabled.
+func hasUncleanPath(req *http.Request) bool {
+	if req.URL.RawPath != "" {
+		return hasDotOrEmptySegment(req.URL.RawPath)
+	}
+	return hasDotOrEmptySegment(req.URL.Path)
 }
