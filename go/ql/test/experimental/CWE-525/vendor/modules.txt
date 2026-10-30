@@ -2,8 +2,8 @@
 ## explicit; go 1.13
 github.com/andybalholm/brotli
 github.com/andybalholm/brotli/matchfinder
-# github.com/go-chi/chi/v5 v5.2.4
-## explicit; go 1.22
+# github.com/go-chi/chi/v5 v5.4.0
+## explicit; go 1.24
 github.com/go-chi/chi/v5
 github.com/go-chi/chi/v5/middleware
 # github.com/gofiber/fiber/v2 v2.52.14
