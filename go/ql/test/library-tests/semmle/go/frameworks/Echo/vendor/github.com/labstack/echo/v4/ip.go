@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: © 2015 LabStack LLC and Echo contributors
+
 package echo
 
 import (
@@ -21,7 +24,8 @@ To retrieve IP address reliably/securely, you must let your application be aware
 In Echo, this can be done by configuring `Echo#IPExtractor` appropriately.
 This guides show you why and how.
 
-> Note: if you dont' set `Echo#IPExtractor` explicitly, Echo fallback to legacy behavior, which is not a good choice.
+> Note: if you don't set `Echo#IPExtractor` explicitly, Echo uses the connection peer and ignores forwarding headers.
+> Applications behind proxies must configure a trusted proxy extractor to recover individual client addresses.
 
 Let's start from two questions to know the right direction:
 
@@ -64,7 +68,7 @@ XFF:  "x"                   "x, a"                  "x, a, b"
 ```
 
 In this case, use **first _untrustable_ IP reading from right**. Never use first one reading from left, as it is
-configurable by client. Here "trustable" means "you are sure the IP address belongs to your infrastructre".
+configurable by client. Here "trustable" means "you are sure the IP address belongs to your infrastructure".
 In above example, if `b` and `c` are trustable, the IP address of the client is `a` for both cases, never be `x`.
 
 In Echo, use `ExtractIPFromXFFHeader(...TrustOption)`.
@@ -111,10 +115,10 @@ To control this behavior, use [`TrustOption`](https://godoc.org/github.com/labst
 
 ## About default behavior
 
-In default behavior, Echo sees all of first XFF header, X-Real-IP header and IP from network layer.
-
-As you might already notice, after reading this article, this is not good.
-Sole reason this is default is just backward compatibility.
+By default, Echo uses the connection peer from req.RemoteAddr and ignores X-Forwarded-For and X-Real-IP.
+This prevents clients from choosing their own identity for rate limiting, access control, or proxy forwarding.
+Behind a proxy, all clients share that proxy's address unless Echo#IPExtractor is configured.
+Configure a header extractor with trust options limited to your own proxies before relying on individual client IPs.
 
 ## Private IP ranges
 
@@ -131,10 +135,10 @@ Private IPv6 address ranges:
 */
 
 type ipChecker struct {
+	trustExtraRanges []*net.IPNet
 	trustLoopback    bool
 	trustLinkLocal   bool
 	trustPrivateNet  bool
-	trustExtraRanges []*net.IPNet
 }
 
 // TrustOption is config for which IP address to trust
@@ -176,16 +180,6 @@ func newIPChecker(configs []TrustOption) *ipChecker {
 	return checker
 }
 
-// Go1.16+ added `ip.IsPrivate()` but until that use this implementation
-func isPrivateIPRange(ip net.IP) bool {
-	if ip4 := ip.To4(); ip4 != nil {
-		return ip4[0] == 10 ||
-			ip4[0] == 172 && ip4[1]&0xf0 == 16 ||
-			ip4[0] == 192 && ip4[1] == 168
-	}
-	return len(ip) == net.IPv6len && ip[0]&0xfe == 0xfc
-}
-
 func (c *ipChecker) trust(ip net.IP) bool {
 	if c.trustLoopback && ip.IsLoopback() {
 		return true
@@ -193,7 +187,7 @@ func (c *ipChecker) trust(ip net.IP) bool {
 	if c.trustLinkLocal && ip.IsLinkLocalUnicast() {
 		return true
 	}
-	if c.trustPrivateNet && isPrivateIPRange(ip) {
+	if c.trustPrivateNet && ip.IsPrivate() {
 		return true
 	}
 	for _, trustedRange := range c.trustExtraRanges {
@@ -216,8 +210,14 @@ func ExtractIPDirect() IPExtractor {
 }
 
 func extractIP(req *http.Request) string {
-	ra, _, _ := net.SplitHostPort(req.RemoteAddr)
-	return ra
+	host, _, err := net.SplitHostPort(req.RemoteAddr)
+	if err != nil {
+		if net.ParseIP(req.RemoteAddr) != nil {
+			return req.RemoteAddr
+		}
+		return ""
+	}
+	return host
 }
 
 // ExtractIPFromRealIPHeader extracts IP address using x-real-ip header.
@@ -225,13 +225,21 @@ func extractIP(req *http.Request) string {
 func ExtractIPFromRealIPHeader(options ...TrustOption) IPExtractor {
 	checker := newIPChecker(options)
 	return func(req *http.Request) string {
+		directIP := extractIP(req)
 		realIP := req.Header.Get(HeaderXRealIP)
-		if realIP != "" {
-			if ip := net.ParseIP(realIP); ip != nil && checker.trust(ip) {
+		if realIP == "" {
+			return directIP
+		}
+
+		if checker.trust(net.ParseIP(directIP)) {
+			realIP = strings.TrimPrefix(realIP, "[")
+			realIP = strings.TrimSuffix(realIP, "]")
+			if rIP := net.ParseIP(realIP); rIP != nil {
 				return realIP
 			}
 		}
-		return extractIP(req)
+
+		return directIP
 	}
 }
 
@@ -248,7 +256,10 @@ func ExtractIPFromXFFHeader(options ...TrustOption) IPExtractor {
 		}
 		ips := append(strings.Split(strings.Join(xffs, ","), ","), directIP)
 		for i := len(ips) - 1; i >= 0; i-- {
-			ip := net.ParseIP(strings.TrimSpace(ips[i]))
+			ips[i] = strings.TrimSpace(ips[i])
+			ips[i] = strings.TrimPrefix(ips[i], "[")
+			ips[i] = strings.TrimSuffix(ips[i], "]")
+			ip := net.ParseIP(ips[i])
 			if ip == nil {
 				// Unable to parse IP; cannot trust entire records
 				return directIP

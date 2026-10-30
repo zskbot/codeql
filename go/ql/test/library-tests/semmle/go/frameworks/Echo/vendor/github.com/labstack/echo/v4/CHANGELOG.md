@@ -1,5 +1,613 @@
 # Changelog
 
+## v4.16.3 - 2026-10-29
+
+**Security**
+
+* **Client IP defaults:** when `Echo#IPExtractor` is unset, `Context.RealIP()` now uses the connection peer and ignores `X-Forwarded-For` and `X-Real-IP`. This prevents clients from selecting their own default rate-limit bucket. Fixes [CVE-2026-118653](https://github.com/labstack/echo/security/advisories/GHSA-246p-cpwv-v3jq).
+* **Proxy identity:** Proxy middleware always replaces upstream `X-Real-IP` with the derived client identity, including after `Connection`-nominated header removal and on WebSocket upgrades. The identity is derived once and preserved across retries. Fixes [CVE-2026-118651](https://github.com/labstack/echo/security/advisories/GHSA-99jh-6h7p-pp36).
+
+**Migration required for applications behind proxies**
+
+Configure `Echo#IPExtractor` to trust only your deployment's proxies before upgrading. Otherwise, clients behind one proxy share its address for rate limiting, access controls, logging, and proxy forwarding. See the [README migration example](README.md#client-ip-security-migration-since-v4163) for explicit XFF trust ranges; use the same trust options with `ExtractIPFromRealIPHeader` for proxies that set `X-Real-IP`. Configure the outermost proxy to replace client-supplied identity headers. Explicit extractors and custom rate-limit identifiers retain their behavior.
+
+**Other changes**
+
+* The direct-peer fallback now accepts bare IPv4 and IPv6 addresses without a port.
+* Document v4 bug-fix and security-fix support dates (#3194).
+
+Implementation: [#3197](https://github.com/labstack/echo/pull/3197). No dependency or minimum Go-version changes; Go 1.26 or later remains required.
+
+## v4.16.0 - 2026-09-27
+
+**Security**
+
+This release fixes several security issues. Upgrading is recommended. Some fixes change behavior; read "Behavior changes to check before upgrading" below.
+
+* **Request scheme:** `Context.Scheme()` now uses the `X-Forwarded-Proto`, `X-Forwarded-Protocol`, `X-Forwarded-Ssl` and `X-Url-Scheme` headers only when the request comes directly from a loopback, link-local or private network address or a unix socket. Before this, any client could send `X-Forwarded-Proto: https` over plain HTTP and skip `HTTPSRedirect`. When `X-Forwarded-Proto` is present, only it is used (its last value), and the scheme is returned in lowercase. the new `Echo#SchemeExtractor` field selects the strategy: `ExtractSchemeFromHeaders(...TrustOption)` (default), `ExtractSchemeDirect()` or `LegacySchemeExtractor()`. The Secure middleware now sets HSTS based on `Context.Scheme()`. The Proxy middleware always sets `X-Forwarded-Proto` from `Context.Scheme()` and removes `X-Forwarded-Ssl`, `X-Forwarded-Protocol` and `X-Url-Scheme` before forwarding. [GHSA-2ffq-g2xg-c22p](https://github.com/labstack/echo/security/advisories/GHSA-2ffq-g2xg-c22p)
+* **JSONP:** `Context.JSONP` and `Context.JSONPBlob` accept only a callback that is empty, a JavaScript identifier or a dot-separated path of identifiers (ASCII letters, digits, `_` and `$`). Any other callback returns a 400 Bad Request error that wraps the new `ErrInvalidJSONPCallback`, and nothing is written. JSONP responses now carry `X-Content-Type-Options: nosniff`. JSONP lets any website read the response with the user's cookies, so do not use it for data that needs authentication. [GHSA-h9g5-28mm-hx3g](https://github.com/labstack/echo/security/advisories/GHSA-h9g5-28mm-hx3g)
+* **MethodOverride:** a POST can no longer be overridden to `GET`, `HEAD`, `OPTIONS`, `TRACE` or `CONNECT`. Before this, with the `MethodFromForm` or `MethodFromQuery` getter and MethodOverride registered with `Use` before the CSRF middleware, `_method=GET` skipped the CSRF check. Register MethodOverride with `Echo#Pre`. [GHSA-r7w9-592q-9vg4](https://github.com/labstack/echo/security/advisories/GHSA-r7w9-592q-9vg4)
+* **Redirects:** the trailing slash middlewares and the static directory redirect percent-encode control characters in the redirect path. Before this, `/%09/evil.example/` redirected browsers to `evil.example`. [GHSA-v753-g4cw-jm48](https://github.com/labstack/echo/security/advisories/GHSA-v753-g4cw-jm48)
+* **Static files:** with the default settings, the Static middleware resolves files from the same form of the path that the router matched, so `/admin%2Fsecret.txt` or `/%61dmin/secret.txt` can no longer reach a file under a guarded `/admin/*` route. [GHSA-375p-5qhx-8wq4](https://github.com/labstack/echo/security/advisories/GHSA-375p-5qhx-8wq4) The Static middleware and `StaticDirectoryHandler` (used by `Echo.Static`, `Echo.StaticFS`, `Group.Static` and `Group.StaticFS`) no longer serve paths with a `.`, `..` or empty segment, such as `/assets/../admin/secret.txt`, also after path unescaping. [GHSA-3pmx-cf9f-34xr](https://github.com/labstack/echo/security/advisories/GHSA-3pmx-cf9f-34xr)
+* **Dependencies:** update `golang.org/x/text` to v0.40.0 ([GO-2026-5970](https://pkg.go.dev/vuln/GO-2026-5970)).
+
+**Client IP address (no code change in v4)**
+
+Without `Echo#IPExtractor`, `Context.RealIP()` in v4 trusts the `X-Forwarded-For` and `X-Real-IP` headers from any client, so the rate limiter can be bypassed and the Proxy middleware forwards a spoofed `X-Real-IP` ([GHSA-246p-cpwv-v3jq](https://github.com/labstack/echo/security/advisories/GHSA-246p-cpwv-v3jq), [GHSA-99jh-6h7p-pp36](https://github.com/labstack/echo/security/advisories/GHSA-99jh-6h7p-pp36)). Changing this default in v4 would put all clients behind a proxy into one rate-limit bucket, so v4 keeps it. Set an extractor that matches your deployment:
+```go
+e.IPExtractor = echo.ExtractIPDirect()        // no proxy in front of the app
+e.IPExtractor = echo.ExtractIPFromXFFHeader() // behind proxies in private networks that set X-Forwarded-For
+// behind a proxy with public addresses (e.g. a CDN), also trust its ranges:
+// e.IPExtractor = echo.ExtractIPFromXFFHeader(echo.TrustIPRange(cdnRange))
+```
+v5 uses the direct peer address by default since v5.1.0.
+
+**Behavior changes to check before upgrading**
+
+* **Proxies or load balancers with public IP addresses.** If a proxy connects to your app from a public (or `100.64.0.0/10`) address, its `X-Forwarded-Proto` is now ignored: `HTTPSRedirect` redirects in a loop and the Secure middleware stops sending HSTS. This affects, for example, Cloudflare, CloudFront and Azure Front Door connecting to a public origin, the GCP external HTTP(S) load balancer including GKE Ingress (`35.191.0.0/16`, `130.211.0.0/22`), and networks that use `100.64.0.0/10` (such as Alibaba Cloud SLB or EKS custom networking). Trust the proxy's address ranges:
+  ```go
+  _, gclb1, _ := net.ParseCIDR("35.191.0.0/16")
+  _, gclb2, _ := net.ParseCIDR("130.211.0.0/22")
+  e.SchemeExtractor = echo.ExtractSchemeFromHeaders(echo.TrustIPRange(gclb1), echo.TrustIPRange(gclb2))
+  ```
+  Proxies on the same host, in a private network (AWS ALB, in-cluster ingress controllers such as ingress-nginx or Traefik, most PaaS routers) or on a unix socket keep working without changes. `echo.LegacySchemeExtractor()` restores the old behavior but is not safe unless every request passes through a proxy that sets these headers. Serverless adapters or middleware that set `RemoteAddr` to the client's address also make `X-Forwarded-Proto` ignored (or, if they take it from a header, spoofable).
+* **Trusted proxies must set `X-Forwarded-Proto`.** A proxy on a trusted address that passes the client's `X-Forwarded-Proto` through (for example nginx without `proxy_set_header X-Forwarded-Proto $scheme;`) still lets the client choose the scheme. An invalid `X-Forwarded-Proto` value now results in `http` instead of falling back to the other scheme headers.
+* **Your own tests.** `httptest.NewRequest` sets `RemoteAddr` to `192.0.2.1:1234`, which is not trusted, so tests that set `X-Forwarded-Proto` now see `http`. Set `req.RemoteAddr = "10.0.0.1:1234"` or use `e.SchemeExtractor = echo.LegacySchemeExtractor()` in such tests.
+* **Proxy middleware headers.** `X-Forwarded-Ssl`, `X-Forwarded-Protocol` and `X-Url-Scheme` are no longer forwarded to the upstream; `X-Forwarded-Proto` carries the scheme.
+* **MethodOverride.** Overriding a POST to `GET` (for example with `X-HTTP-Method-Override: GET` to send a long query in a POST body) is no longer done; such requests keep the POST method.
+* **Static files.** Paths with a double slash or dot segment (for example `/assets//app.js`) now return 404; in HTML5 mode the index is still served. The Static middleware no longer finds file names that the client sends with non-default escaping (for example `%2C`, `%40` or lowercase hex like `%c3%a9`) unless `StaticConfig.EnablePathUnescaping` is set; `Echo.Static` has behaved this way since v4.15.4. With `StaticConfig.EnablePathUnescaping` or `Echo#EnablePathUnescapingStaticFiles`, encoded dots (`%2e%2e`) no longer traverse directories, but encoded slashes are still decoded, so do not combine these options with route-based access control.
+* **JSONP.** `Context.JSONP` returns an error for callbacks that are not JavaScript identifiers.
+
+**Documentation**
+
+* Static middleware: when registered with `Echo#Use` it runs before route and group middleware, so route guards do not protect the files it serves.
+
+
+## v4.15.4 - 2026-06-15
+
+**Security**
+
+Fixes [GHSA-vfp3-v2gw-7wfq](https://github.com/labstack/echo/security/advisories/GHSA-vfp3-v2gw-7wfq)
+
+Make serving static file releated methods  and middleware not unescape path by default - so how the way Router interprets paths and Static methods/middleware is consistent.
+
+Given following situation:
+```go
+// 0.
+// given folder structure:
+// private.txt
+// public/
+// public/index.html
+// public/text.txt
+// public/admin/private.txt
+
+// 1. share `public/` folder contents from the server root. This folder actually contains subfolder `admin` which
+// contents we want to forbid from downloading
+e.Static("/", "public")
+
+// 2. naively assume that everything under /admin folder is now forbidden
+e.GET("/admin/*", func(c *Context) error {
+    return ErrForbidden
+})
+```
+
+Then requests to `/admin%2fprivate.txt` would not be matched to `GET /admin/*` route (routing does not look unescaped path) and static file serving will use unescaped path to serve the file.
+
+Note: this way of "guarding" subfolders will never work for for paths like `/assets/../admin%2fprivate.txt` which will `path.Clean("/assets/../admin%2fprivate.txt")` to `/admin/private.txt` and are servable if static file serving is configured to unescape paths.
+
+If you want to guard routes - use middlewares on `Static*` methods and before `Static` middleware.
+
+**Breaking change / migration:** If you serve files whose names contain URL-encoded characters (e.g., `/hello%20world.txt` → `hello world.txt`), you must now opt in:
+
+```go
+	e := echo.New()
+	e.EnablePathUnescapingStaticFiles = true  // <-- enable old behavior
+	e.Static("/", "public")
+```
+for static middleware
+```go
+	e.Use(middleware.StaticWithConfig(middleware.StaticConfig{
+		EnablePathUnescaping: true, // <-- enable old behavior
+	}))
+```
+
+
+## v4.15.3 - 2026-06-14
+
+**Security**
+
+* fix(static): reject encoded path separators that bypass route-level middleware by @vishr in https://github.com/labstack/echo/pull/3011
+
+Fixes [GHSA-vfp3-v2gw-7wfq](https://github.com/labstack/echo/security/advisories/GHSA-vfp3-v2gw-7wfq): an encoded path separator (`%2F` or `%5C`) in a static file URL could bypass route-level middleware (e.g. authentication on a sibling route) and disclose static files. Both `StaticDirectoryHandler` (used by `Static`/`StaticFS`) and the `Static` middleware are affected. Backport of the v5 fix (#3009). Thanks to @a-tt-om and @oran-gugu for reporting.
+
+
+## v4.15.2 - 2026-05-01
+
+**Security**
+
+* `Context.Scheme()` should validate values taken from header by @aldas in https://github.com/labstack/echo/pull/2962
+
+Thanks to @shblue21 for reporting this [issue](https://github.com/labstack/echo/issues/2952).
+
+
+## v4.15.1 - 2026-02-22
+
+**Enhancements**
+
+* CSRF: support older token-based CSRF protection handler that want to render token into template by @aldas in https://github.com/labstack/echo/pull/2905
+
+
+## v4.15.0 - 2026-01-01
+
+
+**Security**
+
+NB: **If your application relies on cross-origin or same-site (same subdomain) requests do not blindly push this version to production**
+
+
+The CSRF middleware now supports the [**Sec-Fetch-Site**](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Sec-Fetch-Site) header as a modern, defense-in-depth approach to [CSRF
+protection](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html#fetch-metadata-headers), implementing the OWASP-recommended Fetch Metadata API alongside the traditional token-based mechanism.
+
+**How it works:**
+
+Modern browsers automatically send the `Sec-Fetch-Site` header with all requests, indicating the relationship
+between the request origin and the target. The middleware uses this to make security decisions:
+
+- **`same-origin`** or **`none`**: Requests are allowed (exact origin match or direct user navigation)
+- **`same-site`**: Falls back to token validation (e.g., subdomain to main domain)
+- **`cross-site`**: Blocked by default with 403 error for unsafe methods (POST, PUT, DELETE, PATCH)
+
+For browsers that don't send this header (older browsers), the middleware seamlessly falls back to
+traditional token-based CSRF protection.
+
+**New Configuration Options:**
+- `TrustedOrigins []string`: Allowlist specific origins for cross-site requests (useful for OAuth callbacks, webhooks)
+- `AllowSecFetchSiteFunc func(echo.Context) (bool, error)`: Custom logic for same-site/cross-site request validation
+
+**Example:**
+  ```go
+  e.Use(middleware.CSRFWithConfig(middleware.CSRFConfig{
+      // Allow OAuth callbacks from trusted provider
+      TrustedOrigins: []string{"https://oauth-provider.com"},
+
+      // Custom validation for same-site requests
+      AllowSecFetchSiteFunc: func(c echo.Context) (bool, error) {
+          // Your custom authorization logic here
+          return validateCustomAuth(c), nil
+          // return true, err  // blocks request with error
+          // return true, nil  // allows CSRF request through
+          // return false, nil // falls back to legacy token logic
+      },
+  }))
+  ```
+PR: https://github.com/labstack/echo/pull/2858
+
+**Type-Safe Generic Parameter Binding**
+
+* Added generic functions for type-safe parameter extraction and context access by @aldas in https://github.com/labstack/echo/pull/2856
+
+  Echo now provides generic functions for extracting path, query, and form parameters with automatic type conversion,
+  eliminating manual string parsing and type assertions.
+
+  **New Functions:**
+  - Path parameters: `PathParam[T]`, `PathParamOr[T]`
+  - Query parameters: `QueryParam[T]`, `QueryParamOr[T]`, `QueryParams[T]`, `QueryParamsOr[T]`
+  - Form values: `FormParam[T]`, `FormParamOr[T]`, `FormParams[T]`, `FormParamsOr[T]`
+  - Context store: `ContextGet[T]`, `ContextGetOr[T]`
+
+  **Supported Types:**
+  Primitives (`bool`, `string`, `int`/`uint` variants, `float32`/`float64`), `time.Duration`, `time.Time`
+  (with custom layouts and Unix timestamp support), and custom types implementing `BindUnmarshaler`,
+  `TextUnmarshaler`, or `JSONUnmarshaler`.
+
+  **Example:**
+  ```go
+  // Before: Manual parsing
+  idStr := c.Param("id")
+  id, err := strconv.Atoi(idStr)
+
+  // After: Type-safe with automatic parsing
+  id, err := echo.PathParam[int](c, "id")
+
+  // With default values
+  page, err := echo.QueryParamOr[int](c, "page", 1)
+  limit, err := echo.QueryParamOr[int](c, "limit", 20)
+
+  // Type-safe context access (no more panics from type assertions)
+  user, err := echo.ContextGet[*User](c, "user")
+  ```
+  
+PR: https://github.com/labstack/echo/pull/2856
+
+
+
+**DEPRECATION NOTICE** Timeout Middleware Deprecated - Use ContextTimeout Instead
+
+The `middleware.Timeout` middleware has been **deprecated** due to fundamental architectural issues that cause
+data races. Use `middleware.ContextTimeout` or `middleware.ContextTimeoutWithConfig` instead.
+
+**Why is this being deprecated?**
+
+The Timeout middleware manipulates response writers across goroutine boundaries, which causes data races that
+cannot be reliably fixed without a complete architectural redesign. The middleware:
+
+- Swaps the response writer using `http.TimeoutHandler`
+- Must be the first middleware in the chain (fragile constraint)
+- Can cause races with other middleware (Logger, metrics, custom middleware)
+- Has been the source of multiple race condition fixes over the years
+
+**What should you use instead?**
+
+The `ContextTimeout` middleware (available since v4.12.0) provides timeout functionality using Go's standard
+context mechanism. It is:
+
+- Race-free by design
+- Can be placed anywhere in the middleware chain
+- Simpler and more maintainable
+- Compatible with all other middleware
+
+**Migration Guide:**
+
+```go
+// Before (deprecated):
+e.Use(middleware.Timeout())
+
+// After (recommended):
+e.Use(middleware.ContextTimeout(30 * time.Second))
+```
+
+**Important Behavioral Differences:**
+
+1. **Handler cooperation required**: With ContextTimeout, your handlers must check `context.Done()` for cooperative
+   cancellation. The old Timeout middleware would send a 503 response regardless of handler cooperation, but had
+   data race issues.
+
+2. **Error handling**: ContextTimeout returns errors through the standard error handling flow. Handlers that receive
+   `context.DeadlineExceeded` should handle it appropriately:
+
+```go
+e.GET("/long-task", func(c echo.Context) error {
+    ctx := c.Request().Context()
+
+    // Example: database query with context
+    result, err := db.QueryContext(ctx, "SELECT * FROM large_table")
+    if err != nil {
+        if errors.Is(err, context.DeadlineExceeded) {
+            // Handle timeout
+            return echo.NewHTTPError(http.StatusServiceUnavailable, "Request timeout")
+        }
+        return err
+    }
+
+    return c.JSON(http.StatusOK, result)
+})
+```
+
+3. **Background tasks**: For long-running background tasks, use goroutines with context:
+
+```go
+e.GET("/async-task", func(c echo.Context) error {
+    ctx := c.Request().Context()
+
+    resultCh := make(chan Result, 1)
+    errCh := make(chan error, 1)
+
+    go func() {
+        result, err := performLongTask(ctx)
+        if err != nil {
+            errCh <- err
+            return
+        }
+        resultCh <- result
+    }()
+
+    select {
+    case result := <-resultCh:
+        return c.JSON(http.StatusOK, result)
+    case err := <-errCh:
+        return err
+    case <-ctx.Done():
+        return echo.NewHTTPError(http.StatusServiceUnavailable, "Request timeout")
+    }
+})
+```
+
+**Enhancements**
+
+* Fixes by @aldas in https://github.com/labstack/echo/pull/2852
+* Generic functions by @aldas in https://github.com/labstack/echo/pull/2856
+* CRSF with Sec-Fetch-Site checks by @aldas in https://github.com/labstack/echo/pull/2858
+
+
+## v4.14.0 - 2025-12-11
+
+`middleware.Logger` has been deprecated. For request logging, use `middleware.RequestLogger` or
+`middleware.RequestLoggerWithConfig`.
+
+`middleware.RequestLogger` replaces `middleware.Logger`, offering comparable configuration while relying on the
+Go standard library’s new `slog` logger.
+
+The previous default output format was JSON. The new default follows the standard `slog` logger settings.
+To continue emitting request logs in JSON, configure `slog` accordingly:
+```go
+slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+e.Use(middleware.RequestLogger())
+```
+
+
+**Security**
+
+* Logger middleware json string escaping and deprecation by @aldas in https://github.com/labstack/echo/pull/2849
+
+
+
+**Enhancements**
+
+* Update deps  by @aldas in https://github.com/labstack/echo/pull/2807
+* refactor to use reflect.TypeFor by @cuiweixie in https://github.com/labstack/echo/pull/2812
+* Use Go 1.25 in CI by @aldas in https://github.com/labstack/echo/pull/2810
+* Modernize context.go by replacing interface{} with any by @vishr in https://github.com/labstack/echo/pull/2822
+* Fix typo in SetParamValues comment by @vishr in https://github.com/labstack/echo/pull/2828
+* Fix typo in ContextTimeout middleware comment by @vishr in https://github.com/labstack/echo/pull/2827
+* Improve BasicAuth middleware: use strings.Cut and RFC compliance by @vishr in https://github.com/labstack/echo/pull/2825
+* Fix duplicate plus operator in router backtracking logic by @yuya-morimoto in https://github.com/labstack/echo/pull/2832
+* Replace custom private IP range check with built-in net.IP.IsPrivate by @kumapower17 in https://github.com/labstack/echo/pull/2835
+* Ensure proxy connection is closed in proxyRaw function(#2837) by @kumapower17 in https://github.com/labstack/echo/pull/2838
+* Update deps by @aldas in https://github.com/labstack/echo/pull/2843
+* Update golang.org/x/* deps by @aldas in https://github.com/labstack/echo/pull/2850
+
+
+
+## v4.13.4 - 2025-05-22
+
+**Enhancements**
+
+* chore: fix some typos in comment by @zhuhaicity in https://github.com/labstack/echo/pull/2735
+* CI: test with Go 1.24 by @aldas in https://github.com/labstack/echo/pull/2748
+* Add support for TLS WebSocket proxy by @t-ibayashi-safie in https://github.com/labstack/echo/pull/2762
+
+**Security**
+
+* Update dependencies for [GO-2025-3487](https://pkg.go.dev/vuln/GO-2025-3487), [GO-2025-3503](https://pkg.go.dev/vuln/GO-2025-3503) and [GO-2025-3595](https://pkg.go.dev/vuln/GO-2025-3595) in https://github.com/labstack/echo/pull/2780
+
+
+## v4.13.3 - 2024-12-19
+
+**Security**
+
+* Update golang.org/x/net dependency [GO-2024-3333](https://pkg.go.dev/vuln/GO-2024-3333) in https://github.com/labstack/echo/pull/2722
+
+
+## v4.13.2 - 2024-12-12
+
+**Security**
+
+* Update dependencies (dependabot reports [GO-2024-3321](https://pkg.go.dev/vuln/GO-2024-3321)) in https://github.com/labstack/echo/pull/2721
+
+
+## v4.13.1 - 2024-12-11
+
+**Fixes**
+
+* Fix BindBody ignoring `Transfer-Encoding: chunked` requests by @178inaba in https://github.com/labstack/echo/pull/2717
+
+
+
+## v4.13.0 - 2024-12-04
+
+**BREAKING CHANGE** JWT Middleware Removed from Core use [labstack/echo-jwt](https://github.com/labstack/echo-jwt) instead
+
+The JWT middleware has been **removed from Echo core** due to another security vulnerability, [CVE-2024-51744](https://nvd.nist.gov/vuln/detail/CVE-2024-51744). For more details, refer to issue [#2699](https://github.com/labstack/echo/issues/2699). A drop-in replacement is available in the [labstack/echo-jwt](https://github.com/labstack/echo-jwt) repository.
+
+**Important**: Direct assignments like `token := c.Get("user").(*jwt.Token)` will now cause a panic due to an invalid cast. Update your code accordingly. Replace the current imports from `"github.com/golang-jwt/jwt"` in your handlers to the new middleware version using `"github.com/golang-jwt/jwt/v5"`.
+
+
+Background: 
+
+The version of `golang-jwt/jwt` (v3.2.2) previously used in Echo core has been in an unmaintained state for some time. This is not the first vulnerability affecting this library; earlier issues were addressed in [PR #1946](https://github.com/labstack/echo/pull/1946).
+JWT middleware was marked as deprecated in Echo core as of [v4.10.0](https://github.com/labstack/echo/releases/tag/v4.10.0) on 2022-12-27. If you did not notice that, consider leveraging tools like [Staticcheck](https://staticcheck.dev/) to catch such deprecations earlier in you dev/CI flow.  For bonus points - check out [gosec](https://github.com/securego/gosec).
+
+We sincerely apologize for any inconvenience caused by this change. While we strive to maintain backward compatibility within Echo core, recurring security issues with third-party dependencies have forced this decision.
+
+**Enhancements**
+
+* remove jwt middleware by @stevenwhitehead in https://github.com/labstack/echo/pull/2701
+* optimization: struct alignment by @behnambm in https://github.com/labstack/echo/pull/2636
+* bind: Maintain backwards compatibility for map[string]interface{} binding by @thesaltree in https://github.com/labstack/echo/pull/2656
+* Add Go 1.23 to CI by @aldas in https://github.com/labstack/echo/pull/2675
+* improve `MultipartForm` test by @martinyonatann in https://github.com/labstack/echo/pull/2682
+* `bind` : add support of multipart multi files by @martinyonatann in https://github.com/labstack/echo/pull/2684
+* Add TemplateRenderer struct to ease creating renderers for `html/template` and `text/template` packages. by @aldas in https://github.com/labstack/echo/pull/2690
+* Refactor TestBasicAuth to utilize table-driven test format by @ErikOlson in https://github.com/labstack/echo/pull/2688
+* Remove broken header by @aldas in https://github.com/labstack/echo/pull/2705
+* fix(bind body): content-length can be -1 by @phamvinhdat in https://github.com/labstack/echo/pull/2710
+* CORS middleware should compile allowOrigin regexp at creation by @aldas in https://github.com/labstack/echo/pull/2709
+* Shorten Github issue template and add test example by @aldas in https://github.com/labstack/echo/pull/2711
+
+
+## v4.12.0 - 2024-04-15
+
+**Security**
+
+* Update golang.org/x/net dep because of [GO-2024-2687](https://pkg.go.dev/vuln/GO-2024-2687) by @aldas in https://github.com/labstack/echo/pull/2625
+
+
+**Enhancements**
+
+* binder: make binding to Map work better with string destinations by @aldas in https://github.com/labstack/echo/pull/2554
+* README.md: add Encore as sponsor by @marcuskohlberg in https://github.com/labstack/echo/pull/2579
+* Reorder paragraphs in README.md by @aldas in https://github.com/labstack/echo/pull/2581
+* CI: upgrade actions/checkout to v4 by @aldas in https://github.com/labstack/echo/pull/2584
+* Remove default charset from 'application/json' Content-Type header by @doortts in https://github.com/labstack/echo/pull/2568
+* CI: Use Go 1.22 by @aldas in https://github.com/labstack/echo/pull/2588
+* binder: allow binding to a nil map by @georgmu in https://github.com/labstack/echo/pull/2574
+* Add Skipper Unit Test In BasicBasicAuthConfig and Add More Detail Explanation regarding BasicAuthValidator by @RyoKusnadi in https://github.com/labstack/echo/pull/2461
+* fix some typos by @teslaedison in https://github.com/labstack/echo/pull/2603
+* fix: some typos by @pomadev in https://github.com/labstack/echo/pull/2596
+* Allow ResponseWriters to unwrap writers when flushing/hijacking by @aldas in https://github.com/labstack/echo/pull/2595
+* Add SPDX licence comments to files.  by @aldas in https://github.com/labstack/echo/pull/2604
+* Upgrade deps by @aldas in https://github.com/labstack/echo/pull/2605
+* Change type definition blocks to single declarations. This helps copy… by @aldas in https://github.com/labstack/echo/pull/2606
+* Fix Real IP logic by @cl-bvl in https://github.com/labstack/echo/pull/2550
+* Default binder can use `UnmarshalParams(params []string) error` inter… by @aldas in https://github.com/labstack/echo/pull/2607
+* Default binder can bind pointer to slice as struct field. For example  `*[]string` by @aldas in https://github.com/labstack/echo/pull/2608
+* Remove maxparam dependence from Context by @aldas in https://github.com/labstack/echo/pull/2611
+* When route is registered with empty path it is normalized to `/`.  by @aldas in https://github.com/labstack/echo/pull/2616
+* proxy middleware should use httputil.ReverseProxy for SSE requests by @aldas in https://github.com/labstack/echo/pull/2624
+
+
+## v4.11.4 - 2023-12-20
+
+**Security**
+
+* Upgrade golang.org/x/crypto to v0.17.0 to fix vulnerability [issue](https://pkg.go.dev/vuln/GO-2023-2402) [#2562](https://github.com/labstack/echo/pull/2562)
+
+**Enhancements**
+
+* Update deps and mark Go version to 1.18 as this is what golang.org/x/* use [#2563](https://github.com/labstack/echo/pull/2563)
+* Request logger: add example for Slog https://pkg.go.dev/log/slog [#2543](https://github.com/labstack/echo/pull/2543)
+
+
+## v4.11.3 - 2023-11-07
+
+**Security**
+
+* 'c.Attachment' and 'c.Inline' should escape filename in 'Content-Disposition' header to avoid 'Reflect File Download' vulnerability. [#2541](https://github.com/labstack/echo/pull/2541)
+
+**Enhancements**
+
+* Tests: refactor context tests to be separate functions [#2540](https://github.com/labstack/echo/pull/2540)
+* Proxy middleware: reuse echo request context [#2537](https://github.com/labstack/echo/pull/2537)
+* Mark unmarshallable yaml struct tags as ignored [#2536](https://github.com/labstack/echo/pull/2536)
+
+
+## v4.11.2 - 2023-10-11
+
+**Security**
+
+* Bump golang.org/x/net to prevent CVE-2023-39325 / CVE-2023-44487 HTTP/2 Rapid Reset Attack [#2527](https://github.com/labstack/echo/pull/2527)
+* fix(sec): randomString bias introduced by #2490 [#2492](https://github.com/labstack/echo/pull/2492)
+* CSRF/RequestID mw: switch math/random usage to crypto/random [#2490](https://github.com/labstack/echo/pull/2490)
+
+**Enhancements**
+
+* Delete unused context in body_limit.go [#2483](https://github.com/labstack/echo/pull/2483)
+* Use Go 1.21 in CI [#2505](https://github.com/labstack/echo/pull/2505)
+* Fix some typos [#2511](https://github.com/labstack/echo/pull/2511)
+* Allow CORS middleware to send Access-Control-Max-Age: 0 [#2518](https://github.com/labstack/echo/pull/2518)
+* Bump dependancies [#2522](https://github.com/labstack/echo/pull/2522)
+
+## v4.11.1 - 2023-07-16
+
+**Fixes**
+
+* Fix `Gzip` middleware not sending response code for no content responses (404, 301/302 redirects etc) [#2481](https://github.com/labstack/echo/pull/2481)
+
+
+## v4.11.0 - 2023-07-14
+
+
+**Fixes**
+
+* Fixes the proxy middleware concurrency issue of calling the Next() proxy target on Round Robin Balancer [#2409](https://github.com/labstack/echo/pull/2409)
+* Fix `group.RouteNotFound` not working when group has attached middlewares [#2411](https://github.com/labstack/echo/pull/2411)
+* Fix global error handler return error message when message is an error [#2456](https://github.com/labstack/echo/pull/2456)
+* Do not use global timeNow variables [#2477](https://github.com/labstack/echo/pull/2477)
+
+
+**Enhancements**
+
+* Added a optional config variable to disable centralized error handler in recovery middleware [#2410](https://github.com/labstack/echo/pull/2410)
+* refactor: use `strings.ReplaceAll` directly [#2424](https://github.com/labstack/echo/pull/2424)
+* Add support for Go1.20 `http.rwUnwrapper` to Response struct [#2425](https://github.com/labstack/echo/pull/2425)
+* Check whether is nil before invoking centralized error handling [#2429](https://github.com/labstack/echo/pull/2429)
+* Proper colon support in `echo.Reverse` method [#2416](https://github.com/labstack/echo/pull/2416)
+* Fix misuses of a vs an in documentation comments [#2436](https://github.com/labstack/echo/pull/2436)
+* Add link to slog.Handler library for Echo logging into README.md [#2444](https://github.com/labstack/echo/pull/2444)
+* In proxy middleware Support retries of failed proxy requests [#2414](https://github.com/labstack/echo/pull/2414)
+* gofmt fixes to comments [#2452](https://github.com/labstack/echo/pull/2452)
+* gzip response only if it exceeds a minimal length [#2267](https://github.com/labstack/echo/pull/2267)
+* Upgrade packages [#2475](https://github.com/labstack/echo/pull/2475)
+
+
+## v4.10.2 - 2023-02-22
+
+**Security**
+
+* `filepath.Clean` behaviour has changed in Go 1.20 - adapt to it [#2406](https://github.com/labstack/echo/pull/2406)
+* Add `middleware.CORSConfig.UnsafeWildcardOriginWithAllowCredentials` to make UNSAFE usages of wildcard origin + allow cretentials less likely [#2405](https://github.com/labstack/echo/pull/2405)
+
+**Enhancements**
+
+* Add more HTTP error values [#2277](https://github.com/labstack/echo/pull/2277)
+
+
+## v4.10.1 - 2023-02-19
+
+**Security**
+
+* Upgrade deps due to the latest golang.org/x/net vulnerability [#2402](https://github.com/labstack/echo/pull/2402)
+
+
+**Enhancements**
+
+* Add new JWT repository to the README [#2377](https://github.com/labstack/echo/pull/2377)
+* Return an empty string for ctx.path if there is no registered path [#2385](https://github.com/labstack/echo/pull/2385)
+* Add context timeout middleware [#2380](https://github.com/labstack/echo/pull/2380)
+* Update link to jaegertracing [#2394](https://github.com/labstack/echo/pull/2394)
+
+
+## v4.10.0 - 2022-12-27
+
+**Security**
+
+* We are deprecating JWT middleware in this repository. Please use https://github.com/labstack/echo-jwt instead. 
+
+  JWT middleware is moved to separate repository to allow us to bump/upgrade version of JWT implementation (`github.com/golang-jwt/jwt`) we are using
+which we can not do in Echo core because this would break backwards compatibility guarantees we try to maintain.
+
+* This minor version bumps minimum Go version to 1.17 (from 1.16) due `golang.org/x/` packages we depend on. There are
+  several vulnerabilities fixed in these libraries.
+
+  Echo still tries to support last 4 Go versions but there are occasions we can not guarantee this promise.
+
+
+**Enhancements**
+
+* Bump x/text to 0.3.8 [#2305](https://github.com/labstack/echo/pull/2305)
+* Bump dependencies and add notes about Go releases we support [#2336](https://github.com/labstack/echo/pull/2336)
+* Add helper interface for ProxyBalancer interface [#2316](https://github.com/labstack/echo/pull/2316)
+* Expose `middleware.CreateExtractors` function so we can use it from echo-contrib repository [#2338](https://github.com/labstack/echo/pull/2338)
+* Refactor func(Context) error to HandlerFunc [#2315](https://github.com/labstack/echo/pull/2315)
+* Improve function comments [#2329](https://github.com/labstack/echo/pull/2329)
+* Add new method HTTPError.WithInternal [#2340](https://github.com/labstack/echo/pull/2340)
+* Replace io/ioutil package usages [#2342](https://github.com/labstack/echo/pull/2342)
+* Add staticcheck to CI flow [#2343](https://github.com/labstack/echo/pull/2343)
+* Replace relative path determination from proprietary to std [#2345](https://github.com/labstack/echo/pull/2345)
+* Remove square brackets from ipv6 addresses in XFF (X-Forwarded-For header) [#2182](https://github.com/labstack/echo/pull/2182)
+* Add testcases for some BodyLimit middleware configuration options [#2350](https://github.com/labstack/echo/pull/2350)
+* Additional configuration options for RequestLogger and Logger middleware [#2341](https://github.com/labstack/echo/pull/2341)
+* Add route to request log [#2162](https://github.com/labstack/echo/pull/2162)
+* GitHub Workflows security hardening [#2358](https://github.com/labstack/echo/pull/2358)
+* Add govulncheck to CI and bump dependencies [#2362](https://github.com/labstack/echo/pull/2362)
+* Fix rate limiter docs [#2366](https://github.com/labstack/echo/pull/2366)
+* Refactor how `e.Routes()` work and introduce `e.OnAddRouteHandler` callback [#2337](https://github.com/labstack/echo/pull/2337)
+
+
+## v4.9.1 - 2022-10-12
+
+**Fixes**
+
+* Fix logger panicing (when template is set to empty) by bumping dependency version [#2295](https://github.com/labstack/echo/issues/2295)
+
+**Enhancements**
+
+* Improve CORS documentation [#2272](https://github.com/labstack/echo/pull/2272)
+* Update readme about supported Go versions [#2291](https://github.com/labstack/echo/pull/2291)
+* Tests: improve error handling on closing body [#2254](https://github.com/labstack/echo/pull/2254)
+* Tests: refactor some of the assertions in tests [#2275](https://github.com/labstack/echo/pull/2275)
+* Tests: refactor assertions [#2301](https://github.com/labstack/echo/pull/2301)
+
 ## v4.9.0 - 2022-09-04
 
 **Security**
